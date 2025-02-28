@@ -6,8 +6,44 @@ import hashlib
 import json
 from typing import Any, Dict, List, Optional, Set, Tuple, Type, Union
 
+from pydantic import BaseModel, ValidationInfo, field_validator
+
+from uagents.config import get_logger
 from uagents.models import Model
 from uagents.types import IntervalCallback, MessageCallback
+
+logger = get_logger("protocol")
+
+
+class ProtocolSpecification(BaseModel):
+    """
+    Specification for the interactions and roles of a protocol.
+    """
+
+    interactions: Dict[Type[Model], Set[Type[Model]]]
+    roles: Optional[Dict[str, Set[Type[Model]]]] = None
+
+    @field_validator("roles")
+    @classmethod
+    def validate_roles(cls, roles, info: ValidationInfo):
+        """
+        Ensure that all models included in roles are also included in the interactions.
+        """
+        if roles is None:
+            return roles
+
+        interactions: Dict[Type[Model], Set[Type[Model]]] = info.data["interactions"]
+        interaction_models = set(interactions.keys())
+
+        for role, models in roles.items():
+            invalid_models = models - interaction_models
+            if invalid_models:
+                model_names = [model.__name__ for model in invalid_models]
+                raise ValueError(
+                    f"Role '{role}' contains models that don't "
+                    f"exist in interactions: {model_names}"
+                )
+        return roles
 
 
 class Protocol:
@@ -19,7 +55,13 @@ class Protocol:
 
     """
 
-    def __init__(self, name: Optional[str] = None, version: Optional[str] = None):
+    def __init__(
+        self,
+        name: Optional[str] = None,
+        version: Optional[str] = None,
+        spec: Optional[ProtocolSpecification] = None,
+        role: Optional[str] = None,
+    ):
         """
         Initialize a Protocol instance.
 
@@ -37,6 +79,12 @@ class Protocol:
         self._version = version or "0.1.0"
         self._canonical_name = f"{self._name}:{self._version}"
         self._digest = ""
+        self._interactions: Optional[Dict[Type[Model], Set[Type[Model]]]] = None
+        self._role: Optional[str] = None
+        self._locked = False
+
+        if spec:
+            self._init_from_spec(spec, role)
 
     @property
     def intervals(self):
@@ -139,6 +187,52 @@ class Protocol:
         """
         return self.manifest()["metadata"]["digest"]
 
+    def _init_from_spec(self, spec: ProtocolSpecification, role: Optional[str] = None):
+        """
+        Initialize the protocol interactions from a specification.
+
+        Args:
+            spec (ProtocolSpecification): The protocol specification.
+            role (Optional[str], optional): The role that the protocol will implement.
+        """
+        if spec.roles:
+            if role is None:
+                raise ValueError("Role must be specified for a protocol with roles")
+            if role not in spec.roles:
+                raise ValueError(f"Role '{role}' not found in protocol roles")
+            self._role = role
+            self._interactions = {
+                model: replies
+                for model, replies in spec.interactions.items()
+                if model in spec.roles[role]
+            }
+        else:
+            self._interactions = spec.interactions
+
+        for model, replies in self._interactions.items():
+            self.add_interaction(model, replies)
+
+        self._locked = True
+
+    def add_interaction(
+        self, model: Type[Model], replies: Optional[Set[Type[Model]]] = None
+    ):
+        """
+        Add a message model to the protocol along with replies if specified.
+
+        Args:
+            model (Type[Model]): The message model type.
+            replies (Optional[Union[Type[Model], Set[Type[Model]]], optional): The associated
+            reply types. Defaults to None.
+        """
+        model_digest = Model.build_schema_digest(model)
+        self._models[model_digest] = model
+
+        if replies is not None:
+            self.replies[model_digest] = {
+                Model.build_schema_digest(reply): reply for reply in replies
+            }
+
     def on_interval(
         self,
         period: float,
@@ -229,6 +323,11 @@ class Protocol:
         Returns:
             Callable: The decorator to register the message handler.
         """
+        if self._locked and model not in self._models.values():
+            raise ValueError(
+                f"Cannot add interaction '{model.__name__}' "
+                f"to locked protocol {self.canonical_name}"
+            )
 
         def decorator_on_message(func: MessageCallback):
             @functools.wraps(func)
@@ -310,11 +409,6 @@ class Protocol:
             )
 
         for request, responses in self._replies.items():
-            assert (
-                request in self._unsigned_message_handlers
-                or request in self._signed_message_handlers
-            )
-
             manifest["interactions"].append(
                 {
                     "type": "query"
@@ -332,6 +426,36 @@ class Protocol:
         final_manifest["metadata"] = metadata
 
         return final_manifest
+
+    def verify(self) -> bool:
+        """
+        Check if the protocol implements all interactions of its specification.
+
+        Returns:
+            bool: True if the protocol implements the role, False otherwise.
+        """
+        if self._interactions is None:
+            # No specification to verify against
+            return True
+
+        message_handlers = (
+            self._signed_message_handlers | self._unsigned_message_handlers
+        )
+
+        result = True
+        # verify that all models required by the role are implemented
+        for digest, model in self._models.items():
+            if digest not in message_handlers:
+                logger.error(
+                    f"Protocol {self.canonical_name} does not implement "
+                    f"a handler for the model '{model.__name__}'"
+                    + f" required for the role '{self._role}'"
+                    if self._role
+                    else ""
+                )
+                result = False
+
+        return result
 
     @staticmethod
     def compute_digest(manifest: Dict[str, Any]) -> str:
